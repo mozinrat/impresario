@@ -16,13 +16,32 @@
 
 (defonce *registered-workflows* (atom {}))
 
+(defn compile-workflow! [name definition]
+  (let [start-nodes (filter :start (vals (:nodes definition)))]
+    (cond
+      (= 0 start-nodes)
+      (raise (RuntimeException. (format "Error: workflow %s has zero start states declared" name)))
+
+      (= 1 start-nodes)
+      true
+
+      :else
+      (raise (RuntimeException. (format "Error: workflow %s has more than 1 start states declared: %s" name start-nodes)))))
+
+  (doseq [[node node-info] (:nodes definition)]
+    (if-not (:type node-info)
+      (raise (RuntimeException. (format "Error: node[%s] has no :type in workflow %s" node name)))))
+  definition)
+
 (defn register-workflow [name definition]
   (if-not (keyword? name)
     (throw (RuntimeException. (format "workflow name [%s] must be a keyword, it was: %s" name (class name)))))
+  (validate-workflow! name definition)
   (swap! *registered-workflows*
          assoc
          name
-         (assoc definition :name name)))
+         {:definition definition
+          :compiled   (compile-workflow! name definition)}))
 
 ;; TODO: resolve/store off the *ns* predicates via the macro
 ;; TODO: support :unless predicates
@@ -30,7 +49,9 @@
 (defmacro register-workflow! [name definition]
   ;; walk the tree, anywhere we have one of [:if :unless :on-entry
   ;; :on-exit, :on-transition] do the ns resolution
-  `(register-workflow ~name ~definition))
+  `(let [def# ~definition]
+     (register-workflow ~name (assoc def#
+                                :ns (get def# :ns ~'*ns*)))))
 
 (defn lookup-workflow [name]
   (get @*registered-workflows* name))
@@ -238,30 +259,30 @@
     (throw (RuntimeException. "Error: invalid workflow (nil)!")))
   (let [workflow (get-workflow workflow)
         max (or (:max-transitions workflow) *default-max-global-transitions*)]
-   (loop [[prev-state prev-context] [current-state context]
-          [next-state next-context] (transition-once! workflow current-state context)
-          iterations max]
-     ;;(printf "transition! prev-state:%s next-state:%s\n" prev-state next-state)
-     (printf "!! transition! transitioned %s => %s\n" prev-state next-state)
-     (pp/pprint next-context)
-     (cond
-       ;; we're done here, didn't transition
-       (nil? next-state)
-       [prev-state prev-context]
+    (loop [[prev-state prev-context] [current-state context]
+           [next-state next-context] (transition-once! workflow current-state context)
+           iterations max]
+      ;;(printf "transition! prev-state:%s next-state:%s\n" prev-state next-state)
+      (printf "!! transition! transitioned %s => %s\n" prev-state next-state)
+      (pp/pprint next-context)
+      (cond
+        ;; we're done here, didn't transition
+        (nil? next-state)
+        [prev-state prev-context]
 
-       (is-final-state? workflow next-state)
-       [next-state next-context]
+        (is-final-state? workflow next-state)
+        [next-state next-context]
 
-       (zero? iterations)
-       (throw (RuntimeException. (format "Error: maximum number of iterations [%s] exceeded, aborting flow." max)))
+        (zero? iterations)
+        (throw (RuntimeException. (format "Error: maximum number of iterations [%s] exceeded, aborting flow." max)))
 
-       ;; keep trying to transition
-       :else
-       (recur [next-state next-context]
-              (transition-once! workflow next-state next-context)
-              (dec iterations))))))
+        ;; keep trying to transition
+        :else
+        (recur [next-state next-context]
+               (transition-once! workflow next-state next-context)
+               (dec iterations))))))
 
-(defn workflow-to-dot [workflow current-state]
+(defn old-workflow-to-dot [workflow current-state]
   (let [workflow (get-workflow workflow)
         sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))]
     (doseq [state (keys (:states workflow))]
@@ -300,6 +321,9 @@
     (.append sb "}\n")
     (str sb)))
 
+
+
+
 (defn get-start-state [workflow]
   (first (first (filter (fn [[k v]]
                           (:start v))
@@ -327,3 +351,44 @@
       context
     :trace (conj (:trace context [])
                  [curr-state next-state])))
+
+(defn workflow-to-dot [workflow & [current-state]]
+  (let [workflow (get-workflow workflow)
+        current-state (or current-state (get-start-state workflow))
+        sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))
+        node-shape-fn
+        (fn [node node-info]
+          (cond
+            (or (:start node-info)
+                (:stop node-info))
+            "ellipse"
+            (= :action (:type node-info))
+            "box"
+            (= :branch (:type node-info))
+            "diamond"
+            :else
+            "box"))
+        connection-label-fn
+        (fn [connection]
+          (cond
+            (:default connection)
+            "yes"
+            (:if connection)
+            (name (:if connection))
+            (:unless connection)
+            (str "!" (name (:unless connection)))
+            :else
+            "unnamed?"))]
+    (doseq [node (keys (:nodes workflow))]
+      (let [node-info (get (:nodes workflow) node)
+            style (if (= current-state node) ",style=bold" "")]
+        (.append sb (format "  \"%s\" [shape=%s,%s];\n" (name node) (node-shape-fn node node-info) style)))
+      (doseq [connection (get-in workflow [:nodes node :connections])]
+        ;; name the edges...
+        (let [to-node (:to connection)]
+          (.append sb (format "  \"%s\" -> \"%s\" [label=\"%s\"];\n"
+                              (name node)
+                              (name to-node)
+                              (connection-label-fn connection))))))
+    (.append sb "}\n")
+    (str sb)))
