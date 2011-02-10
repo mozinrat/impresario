@@ -3,7 +3,6 @@
   (:use [impresario.core] :reload)
   (:use [clojure.test]))
 
-
 ;; New approach as of: Thu Feb 10 14:07:37 2011
 (def *basic-workflow*
      {:name :basic-workflow
@@ -51,11 +50,36 @@
         :connections [{:to :await-sms :default true}]}}
       })
 
+;; todo: move this into a fixture
+(register-workflow! :basic-workflow *basic-workflow*)
+
+(deftest test-compile-workflow
+  (is (compile-workflow! :basic-workflow *basic-workflow*)))
+
+(deftest test-workflow
+  (loop [[curr-input & inputs] ["this" "that" "other"]
+         prev-state :await-sms
+         [next-state context] (execute! :basic-workflow :await-sms {} 10)]
+    (cond
+      (empty? curr-input)
+      (printf "input exhausted\n")
+
+      :else
+      (recur
+       inputs
+       next-state
+       (execute! :basic-workflow next-state context)))))
+
+(defn basic-workflow-user-sent-sms! [workflow node node-info context]
+  context)
+
+(defn mo-sms-provided? [workflow name node node-info connection context]
+  (:mo-sms context))
+
 (comment
 
   (do
     (require 'clojure.contrib.shell-out)
-    (register-workflow! :basic-workflow *basic-workflow*)
     (spit "examples/basic-workflow.dot"
           (workflow-to-dot :basic-workflow))
     (clojure.contrib.shell-out/sh "bash" "examples/render.sh" "examples/basic-workflow.dot")

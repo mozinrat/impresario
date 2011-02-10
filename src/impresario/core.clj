@@ -16,45 +16,67 @@
 
 (defonce *registered-workflows* (atom {}))
 
-(defn compile-workflow! [name definition]
-  (let [start-nodes (filter :start (vals (:nodes definition)))]
-    (cond
-      (= 0 start-nodes)
-      (raise (RuntimeException. (format "Error: workflow %s has zero start states declared" name)))
+(defn raise [& args]
+  (throw (RuntimeException. (apply format args))))
 
-      (= 1 start-nodes)
+(defn- assert-one-start-node! [wf-name definition]
+  (let [start-nodes (vec (filter :start (vals (:nodes definition))))]
+    (cond
+      (= 0 (count start-nodes))
+      (raise "Error: workflow %s has zero start states declared" wf-name)
+
+      (= 1 (count start-nodes))
       true
 
       :else
-      (raise (RuntimeException. (format "Error: workflow %s has more than 1 start states declared: %s" name start-nodes)))))
+      (raise "Error: workflow %s has more than 1 start states declared: %s" wf-name start-nodes))))
 
+(defn- assert-node-config! [wf-name definition node node-info]
+  (if-not (:type node-info)
+    (raise "Error: node[%s] has no :type in workflow %s" node wf-name)))
+
+(defn assert-connection-config! [wf-name definition node node-info connection-info]
+  (if-not (:to connection-info)
+    (raise "Error: connection-info must speicfy the connecting node in workflow=%s node=%s :: %s"
+           wf-name node connection-info))
+  (if-not (or (:if connection-info)
+              (:unless connection-info)
+              (:default connection-info))
+    (raise "Error: connection-info must speicfy either a predicate (:if/:unless) or that it is the :default transition in workflow=%s node=%s :: %s"
+           wf-name node connection-info))
+  (if-not (= 1 (count (filter identity (map connection-info [:if :unless :default]))))
+    (raise "Error: connection-info must only one of an :if, an :unelss or a :default in workflow=%s node=%s :: %s"
+           wf-name node connection-info)))
+
+(defn compile-workflow! [wf-name definition]
+  (assert-one-start-node! wf-name definition)
   (doseq [[node node-info] (:nodes definition)]
-    (if-not (:type node-info)
-      (raise (RuntimeException. (format "Error: node[%s] has no :type in workflow %s" node name)))))
+    (assert-node-config! wf-name definition node node-info)
+    (doseq [connection-info (:connections node-info)]
+      (assert-connection-config! wf-name definition node node-info connection-info)))
   definition)
 
-(defn register-workflow [name definition]
-  (if-not (keyword? name)
-    (throw (RuntimeException. (format "workflow name [%s] must be a keyword, it was: %s" name (class name)))))
-  (validate-workflow! name definition)
+(defn register-workflow [wf-name definition]
+  (if-not (keyword? wf-name)
+    (raise "workflow name [%s] must be a keyword, it was: %s" wf-name (class wf-name)))
   (swap! *registered-workflows*
          assoc
-         name
+         wf-name
          {:definition definition
-          :compiled   (compile-workflow! name definition)}))
+          :compiled   (compile-workflow! wf-name definition)}))
 
 ;; TODO: resolve/store off the *ns* predicates via the macro
 ;; TODO: support :unless predicates
 
-(defmacro register-workflow! [name definition]
+(defmacro register-workflow! [wf-name definition]
   ;; walk the tree, anywhere we have one of [:if :unless :on-entry
   ;; :on-exit, :on-transition] do the ns resolution
   `(let [def# ~definition]
-     (register-workflow ~name (assoc def#
+     (register-workflow ~wf-name (assoc def#
                                 :ns (get def# :ns ~'*ns*)))))
 
-(defn lookup-workflow [name]
-  (get @*registered-workflows* name))
+(defn lookup-workflow [wf-name]
+  (get @*registered-workflows* wf-name))
 
 (defn get-workflow [wkflow]
   (cond
@@ -67,328 +89,399 @@
     :else
     (throw (RuntimeException. (format "Error: can't get workflow via '%s' not a keyword (lookup) or a map (identity)" wkflow)))))
 
-
-(defn split-keyword-parts [kwd]
-  (.split (.substring (str kwd) 1)
-          "/"))
-
-(defn fn-lookup-via-symbol [sym-name]
-  (let [[ns-name-part sym-name-part] (split-keyword-parts sym-name)]
-    (ns-resolve (symbol ns-name-part)
-                (symbol sym-name-part))))
-
-(defn resolve-keyword-to-fn [pred]
-  (cond
-    (keyword? pred)
-    (fn-lookup-via-symbol pred)
-    :else
-    (throw (RuntimeException. (format "resolve-keyword-to-fn: Don't know how to resolve: '%s'" pred)))))
-
-;; Can't have both a :if and an :unless
-(defn- get-transition-predicate-fn [transition-info]
-  (let [if-pred     (:if transition-info)
-        unless-pred (:unless transition-info)]
-    (printf "> get-transition-predicate-fn: %s\n" transition-info)
-    (cond
-      (and if-pred unless-pred)
-      (throw (RuntimeException. (format "Error: transition:'%s' has both an :if and an :unless!" transition-info)))
-
-      unless-pred
-      (complement (resolve-keyword-to-fn unless-pred))
-
-      if-pred
-      (resolve-keyword-to-fn if-pred)
-
-      :else
-      (throw (RuntimeException. (format "Error: no :if or :else predicates in transition-info:%s" transition-info))))))
-
-
-(defn can-transition-to? [workflow current-state transition-info context]
-  (if-not (contains? (:states workflow) current-state)
-    (throw (RuntimeException. (format  "Error: current-state of %s is invalid. No point in checking transition possibilities." current-state ))))
-  (let [pred       (get-transition-predicate-fn transition-info)
-        state-name (:state transition-info)]
-    (printf "> can-transition-to? testing [%s->%s] pred:%s\n" current-state state-name pred)
-    (if (pred workflow current-state context)
-      state-name
-      nil)))
-
-(defn transition-once? [workflow current-state context]
-  (let [workflow (get-workflow workflow)
-        transitions (:transitions (get (:states workflow)
-                                       current-state))
-        viable-next-states (vec
-                            (filter (fn [transition-info]
-                                      (can-transition-to?
-                                       workflow
-                                       current-state
-                                       transition-info
-                                       context))
-                                    transitions))]
-    (printf "> transition-once?: transitions:%s\n" (vec transitions))
-    (printf "> transition-once?: viable-next-states:%s\n" viable-next-states)
-    (printf "> transition-once?: viable-next-states:%s\n" (vec viable-next-states))
-    (cond
-      (= 1 (count viable-next-states))
-      (:state (first viable-next-states))
-
-      (zero? (count viable-next-states))
-      nil
-
-      :else
-      (throw
-       (RuntimeException.
-        (format "Error: multiple target states! workflow:%s curr:%s viable-targets:%s"
-                (:name workflow)
-                current-state
-                (vec viable-next-states)))))))
-
-(defn transition? [workflow current-state context]
-  (let [workflow (get-workflow workflow)]
-    (loop [prev-state current-state
-           next-state (transition-once? workflow current-state context)]
-      ;;(printf "transition? prev-state:%s next-state:%s\n" prev-state next-state)
-      (if (nil? next-state)
-        ;; we're done here
-        prev-state
-        (recur next-state
-               (transition-once? workflow next-state context))))))
-
-(defn seqize-triggers [triggers]
-  (cond
-    (nil? triggers)
-    nil
-
-    (or (vector? triggers) (seq? triggers))
-    triggers
-
-    :else
-    [triggers]))
-
-(defn on-exit-triggers [workflow state]
-  (let [workflow (get-workflow workflow)]
-    (seqize-triggers (:on-exit (get (:states workflow) state)))))
-
-(defn on-entry-triggers [workflow state]
-  (let [workflow (get-workflow workflow)]
-    (seqize-triggers (:on-entry (get (:states workflow) state)))))
-
-(defn get-transition-info [workflow current-state next-state]
-  (let [workflow (get-workflow workflow)]
-    (filter (fn [state-info]
-              (= next-state (:state state-info)))
-            (:transitions (get (:states workflow)
-                               current-state)))))
-
-(defn on-transition-triggers [workflow current-state next-state]
-  (let [workflow (get-workflow workflow)
-        state-info (get-transition-info workflow current-state next-state)]
-    ;;(printf "on-transition-triggers: %s to %s : %s" current-state next-state (vec state-info))
-    (cond
-      (empty? state-info)
-      (throw
-       (RuntimeException.
-        (format "Error: unable to find transition from %s to %s?? While looking up transition triggers."
-                current-state
-                next-state)))
-
-      (> 1 (count state-info))
-      (RuntimeException.
-       (format "Error: found more than 1 transition from %s to %s?? While looking up transition triggers."
-               current-state
-               next-state))
-
-      :else
-      (seqize-triggers (:on-transition (first state-info))))))
-
-(defn global-transition-triggers [workflow]
-  (let [workflow   (get-workflow workflow)]
-    (if-let [f (:on-transition workflow)]
-      (seqize-triggers f)
-      nil)))
-
-(defn execute-trigger [trigger workflow current-state next-state context]
-  (let [workflow (get-workflow workflow)
-        f (resolve-keyword-to-fn trigger)]
+(defn resolve-node-handler [workflow node node-info]
+  (let [ns (:ns workflow)
+        f  (ns-resolve (:ns workflow) (symbol (name (:handler node-info node))))]
     (if-not f
-      (throw (RuntimeException. (format "Error: unable to resolve trigger (%s) to function!" trigger))))
-    (printf "> executing trigger: %s/%s state:%s/%s\n" trigger f current-state next-state)
-    (f workflow current-state next-state context)))
+      (raise "Error: unable to resolve node (%s/%s) handler function.  node-info=%s" ns (symbol (name (:handler node-info node))) node-info)
+      f)))
 
-(defn execute-triggers [workflow current-state next-state curr-context]
-  (let [context-validator-fn (if (:context-validator-fn workflow)
-                               (resolve-keyword-to-fn (:context-validator-fn workflow))
-                               nil)
-        context (atom curr-context)
-        uuid    (:uuid curr-context)
-        set-context!
-        (fn [trigger-type trigger]
-          (let [v (execute-trigger trigger workflow current-state next-state @context)]
-            (printf "!! execute-triggers/set-context! updated from: %s to %s\n" @context v)
-            (if context-validator-fn
-              (context-validator-fn workflow current-state next-state trigger-type trigger curr-context v))
-            (reset! context v)))]
-    (doseq [trigger (on-exit-triggers workflow current-state)]
-      (set-context! :on-exit       trigger))
-    (doseq [trigger (global-transition-triggers workflow)]
-      (set-context! :global-on-transition trigger))
-    (doseq [trigger (on-transition-triggers workflow current-state next-state)]
-      (set-context! :on-transition trigger))
-    (doseq [trigger (on-entry-triggers workflow next-state)]
-      (set-context! :on-entry      trigger))
-    ;; UUID can't be lost from or overidden in the context
-    (assoc
-        @context
-      :uuid uuid)))
+(defn connection-predicate [workflow workflow-name node connection]
+  (printf "  connection-predicate: workflow-name=%s node=%s connection=%s\n"
+          workflow-name node connection)
+  (pp/pprint workflow)
+  (cond
+    (:if connection)
+    (let [pname (symbol (name (:if connection)))
+          f (ns-resolve (:ns workflow) pname)]
+      (printf "  connection-predicate: if=%s %s %s %s\n" f workflow-name node connection)
+      (if-not f
+        (raise "Error: unable to resolve :if predicate %s %s" (:ns workflow) (:if connection)))
+      f)
 
-(defn transition-once! [workflow current-state context]
-  (let [workflow (get-workflow workflow)
-        next-state (transition-once? workflow current-state context)]
-    (if-not next-state
-      [nil context]
-      [next-state (execute-triggers workflow current-state next-state context)])))
+    (:unless connection)
+    (let [f (ns-resolve (:ns workflow) (symbol (name (:unless connection))))]
+      (printf "  connection-predicate: unlessf=%s %s %s %s\n" f workflow-name node connection)
+      (if-not f
+        (raise "Error: unable to resolve :unless predicate %s %s" (:ns workflow) (:unless connection)))
+      (complement f))
 
-(defn is-final-state? [workflow state-name]
-  (let [workflow (get-workflow workflow)]
-    (get-in workflow [:states state-name :stop])))
+    (:default connection)
+    (do
+      (printf "  connection-predicate: :default %s" connection)
+     (fn [& args] true))))
 
-(def *default-max-global-transitions* 100)
+(defn find-viable-edges [workflow workflow-name node node-info context]
+  (loop [[connection & connections] (:connections node-info)
+         res []]
+    (if (not connection)
+      res
+      (let [p (connection-predicate workflow workflow-name node connection)]
+        (printf "find-viable-edges: p=%s %s %s\n" p workflow-name node)
+        (if (p workflow workflow-name node node-info connection context)
+          (recur connections (conj res connection))
+          (recur connections res))))))
 
-(defn transition! [workflow current-state context]
-  (if (nil? workflow)
-    (throw (RuntimeException. "Error: invalid workflow (nil)!")))
-  (let [workflow (get-workflow workflow)
-        max (or (:max-transitions workflow) *default-max-global-transitions*)]
-    (loop [[prev-state prev-context] [current-state context]
-           [next-state next-context] (transition-once! workflow current-state context)
-           iterations max]
-      ;;(printf "transition! prev-state:%s next-state:%s\n" prev-state next-state)
-      (printf "!! transition! transitioned %s => %s\n" prev-state next-state)
-      (pp/pprint next-context)
+
+(defn execute! [workflow-name node context max]
+  (printf "execute! workflow-name=%s node=%s context=%s max=%s\n" workflow-name node context max)
+  (if (get-in (:compiled (get-workflow workflow-name)) [:nodes node :stop])
+    node
+    (let [workflow         (:compiled (get-workflow workflow-name))
+          node-info        (get-in workflow [:nodes node])
+          node-handler     (resolve-node-handler workflow node node-info)
+          context          (node-handler workflow node node-info context)
+          [next-edge &     viable-edges] (find-viable-edges workflow workflow-name node node-info context)]
       (cond
-        ;; we're done here, didn't transition
-        (nil? next-state)
-        [prev-state prev-context]
+        (zero? max)
+        (raise "Error: max(%s) transitions exhaused" max)
 
-        (is-final-state? workflow next-state)
-        [next-state next-context]
+        (not next-edge)
+        [node context]
 
-        (zero? iterations)
-        (throw (RuntimeException. (format "Error: maximum number of iterations [%s] exceeded, aborting flow." max)))
+        (= 0 (count viable-edges))
+        (do
+          (printf "execute! next-edge=%s context=%s max=%s\n"
+                  next-edge context max)
+          (recur workflow-name (:to next-edge) context (dec max)))
 
-        ;; keep trying to transition
         :else
-        (recur [next-state next-context]
-               (transition-once! workflow next-state next-context)
-               (dec iterations))))))
-
-(defn old-workflow-to-dot [workflow current-state]
-  (let [workflow (get-workflow workflow)
-        sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))]
-    (doseq [state (keys (:states workflow))]
-      (let [shape (if (or (:start (get (:states workflow) state))
-                          (empty? (:transitions (get (:states workflow) state))))
-                    "ellipse"
-                    "box")
-            style (if (= current-state state)
-                    "bold"
-                    "")]
-
-        (.append sb (format "  \"%s\" [shape=%s,style=%s];\n" (name state)
-                            shape style)))
-      (doseq [transition (:transitions (get (:states workflow) state))]
-        ;; name the edges...
-        (let [to-state (:state transition)
-              transition-type
-              (cond (:if transition)
-                    ""
-                    (:unless transition)
-                    "!"
-                    :else
-                    (throw
-                     (RuntimeException.
-                      (format
-                       "Error: no :if or :unless in transition: %s for %s"
-                       transition
-                       state))))
-              pred-name (or (:if transition)
-                            (:unless transition))]
-          (.append sb (format "  \"%s\" -> \"%s\" [label=\" %s%s\"];\n"
-                              (name state)
-                              (name to-state)
-                              transition-type
-                              (name pred-name))))))
-    (.append sb "}\n")
-    (str sb)))
+        [node context]))))
 
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; (defn split-keyword-parts [kwd]
+;;   (.split (.substring (str kwd) 1)
+;;           "/"))
+
+;; (defn fn-lookup-via-symbol [sym-name]
+;;   (let [[ns-name-part sym-name-part] (split-keyword-parts sym-name)]
+;;     (ns-resolve (symbol ns-name-part)
+;;                 (symbol sym-name-part))))
+
+;; (defn resolve-keyword-to-fn [pred]
+;;   (cond
+;;     (keyword? pred)
+;;     (fn-lookup-via-symbol pred)
+;;     :else
+;;     (throw (RuntimeException. (format "resolve-keyword-to-fn: Don't know how to resolve: '%s'" pred)))))
+
+;; ;; Can't have both a :if and an :unless
+;; (defn- get-transition-predicate-fn [transition-info]
+;;   (let [if-pred     (:if transition-info)
+;;         unless-pred (:unless transition-info)]
+;;     (printf "> get-transition-predicate-fn: %s\n" transition-info)
+;;     (cond
+;;       (and if-pred unless-pred)
+;;       (throw (RuntimeException. (format "Error: transition:'%s' has both an :if and an :unless!" transition-info)))
+
+;;       unless-pred
+;;       (complement (resolve-keyword-to-fn unless-pred))
+
+;;       if-pred
+;;       (resolve-keyword-to-fn if-pred)
+
+;;       :else
+;;       (throw (RuntimeException. (format "Error: no :if or :else predicates in transition-info:%s" transition-info))))))
 
 
-(defn get-start-state [workflow]
-  (first (first (filter (fn [[k v]]
-                          (:start v))
-                        (:states (get-workflow workflow))))))
+;; (defn can-transition-to? [workflow current-state transition-info context]
+;;   (if-not (contains? (:states workflow) current-state)
+;;     (throw (RuntimeException. (format  "Error: current-state of %s is invalid. No point in checking transition possibilities." current-state ))))
+;;   (let [pred       (get-transition-predicate-fn transition-info)
+;;         state-name (:state transition-info)]
+;;     (printf "> can-transition-to? testing [%s->%s] pred:%s\n" current-state state-name pred)
+;;     (if (pred workflow current-state context)
+;;       state-name
+;;       nil)))
 
-(defn initialize-workflow [workflow context]
-  "Executes start-state triggers."
-  (let [workflow    (get-workflow    workflow)
-        start-state (get-start-state workflow)
-        state-info  (get (:states workflow) start-state)
-        triggers    (seqize-triggers (:on-entry state-info))]
-    (loop [[trigger triggers] triggers
-           context context]
-      (printf "initialize-workflow: trigger=%s context=%s\n" trigger context)
-      (if trigger
-        (recur triggers
-               (execute-trigger trigger workflow nil start-state context))
-        (assoc
-            context
-          :uuid (str (java.util.UUID/randomUUID)))))))
+;; (defn transition-once? [workflow current-state context]
+;;   (let [workflow (get-workflow workflow)
+;;         transitions (:transitions (get (:states workflow)
+;;                                        current-state))
+;;         viable-next-states (vec
+;;                             (filter (fn [transition-info]
+;;                                       (can-transition-to?
+;;                                        workflow
+;;                                        current-state
+;;                                        transition-info
+;;                                        context))
+;;                                     transitions))]
+;;     (printf "> transition-once?: transitions:%s\n" (vec transitions))
+;;     (printf "> transition-once?: viable-next-states:%s\n" viable-next-states)
+;;     (printf "> transition-once?: viable-next-states:%s\n" (vec viable-next-states))
+;;     (cond
+;;       (= 1 (count viable-next-states))
+;;       (:state (first viable-next-states))
+
+;;       (zero? (count viable-next-states))
+;;       nil
+
+;;       :else
+;;       (throw
+;;        (RuntimeException.
+;;         (format "Error: multiple target states! workflow:%s curr:%s viable-targets:%s"
+;;                 (:name workflow)
+;;                 current-state
+;;                 (vec viable-next-states)))))))
+
+;; (defn transition? [workflow current-state context]
+;;   (let [workflow (get-workflow workflow)]
+;;     (loop [prev-state current-state
+;;            next-state (transition-once? workflow current-state context)]
+;;       ;;(printf "transition? prev-state:%s next-state:%s\n" prev-state next-state)
+;;       (if (nil? next-state)
+;;         ;; we're done here
+;;         prev-state
+;;         (recur next-state
+;;                (transition-once? workflow next-state context))))))
+
+;; (defn seqize-triggers [triggers]
+;;   (cond
+;;     (nil? triggers)
+;;     nil
+
+;;     (or (vector? triggers) (seq? triggers))
+;;     triggers
+
+;;     :else
+;;     [triggers]))
+
+;; (defn on-exit-triggers [workflow state]
+;;   (let [workflow (get-workflow workflow)]
+;;     (seqize-triggers (:on-exit (get (:states workflow) state)))))
+
+;; (defn on-entry-triggers [workflow state]
+;;   (let [workflow (get-workflow workflow)]
+;;     (seqize-triggers (:on-entry (get (:states workflow) state)))))
+
+;; (defn get-transition-info [workflow current-state next-state]
+;;   (let [workflow (get-workflow workflow)]
+;;     (filter (fn [state-info]
+;;               (= next-state (:state state-info)))
+;;             (:transitions (get (:states workflow)
+;;                                current-state)))))
+
+;; (defn on-transition-triggers [workflow current-state next-state]
+;;   (let [workflow (get-workflow workflow)
+;;         state-info (get-transition-info workflow current-state next-state)]
+;;     ;;(printf "on-transition-triggers: %s to %s : %s" current-state next-state (vec state-info))
+;;     (cond
+;;       (empty? state-info)
+;;       (throw
+;;        (RuntimeException.
+;;         (format "Error: unable to find transition from %s to %s?? While looking up transition triggers."
+;;                 current-state
+;;                 next-state)))
+
+;;       (> 1 (count state-info))
+;;       (RuntimeException.
+;;        (format "Error: found more than 1 transition from %s to %s?? While looking up transition triggers."
+;;                current-state
+;;                next-state))
+
+;;       :else
+;;       (seqize-triggers (:on-transition (first state-info))))))
+
+;; (defn global-transition-triggers [workflow]
+;;   (let [workflow   (get-workflow workflow)]
+;;     (if-let [f (:on-transition workflow)]
+;;       (seqize-triggers f)
+;;       nil)))
+
+;; (defn execute-trigger [trigger workflow current-state next-state context]
+;;   (let [workflow (get-workflow workflow)
+;;         f (resolve-keyword-to-fn trigger)]
+;;     (if-not f
+;;       (throw (RuntimeException. (format "Error: unable to resolve trigger (%s) to function!" trigger))))
+;;     (printf "> executing trigger: %s/%s state:%s/%s\n" trigger f current-state next-state)
+;;     (f workflow current-state next-state context)))
+
+;; (defn execute-triggers [workflow current-state next-state curr-context]
+;;   (let [context-validator-fn (if (:context-validator-fn workflow)
+;;                                (resolve-keyword-to-fn (:context-validator-fn workflow))
+;;                                nil)
+;;         context (atom curr-context)
+;;         uuid    (:uuid curr-context)
+;;         set-context!
+;;         (fn [trigger-type trigger]
+;;           (let [v (execute-trigger trigger workflow current-state next-state @context)]
+;;             (printf "!! execute-triggers/set-context! updated from: %s to %s\n" @context v)
+;;             (if context-validator-fn
+;;               (context-validator-fn workflow current-state next-state trigger-type trigger curr-context v))
+;;             (reset! context v)))]
+;;     (doseq [trigger (on-exit-triggers workflow current-state)]
+;;       (set-context! :on-exit       trigger))
+;;     (doseq [trigger (global-transition-triggers workflow)]
+;;       (set-context! :global-on-transition trigger))
+;;     (doseq [trigger (on-transition-triggers workflow current-state next-state)]
+;;       (set-context! :on-transition trigger))
+;;     (doseq [trigger (on-entry-triggers workflow next-state)]
+;;       (set-context! :on-entry      trigger))
+;;     ;; UUID can't be lost from or overidden in the context
+;;     (assoc
+;;         @context
+;;       :uuid uuid)))
+
+;; (defn transition-once! [workflow current-state context]
+;;   (let [workflow (get-workflow workflow)
+;;         next-state (transition-once? workflow current-state context)]
+;;     (if-not next-state
+;;       [nil context]
+;;       [next-state (execute-triggers workflow current-state next-state context)])))
+
+;; (defn is-final-state? [workflow state-name]
+;;   (let [workflow (get-workflow workflow)]
+;;     (get-in workflow [:states state-name :stop])))
+
+;; (def *default-max-global-transitions* 100)
+
+;; (defn transition! [workflow current-state context]
+;;   (if (nil? workflow)
+;;     (throw (RuntimeException. "Error: invalid workflow (nil)!")))
+;;   (let [workflow (get-workflow workflow)
+;;         max (or (:max-transitions workflow) *default-max-global-transitions*)]
+;;     (loop [[prev-state prev-context] [current-state context]
+;;            [next-state next-context] (transition-once! workflow current-state context)
+;;            iterations max]
+;;       ;;(printf "transition! prev-state:%s next-state:%s\n" prev-state next-state)
+;;       (printf "!! transition! transitioned %s => %s\n" prev-state next-state)
+;;       (pp/pprint next-context)
+;;       (cond
+;;         ;; we're done here, didn't transition
+;;         (nil? next-state)
+;;         [prev-state prev-context]
+
+;;         (is-final-state? workflow next-state)
+;;         [next-state next-context]
+
+;;         (zero? iterations)
+;;         (throw (RuntimeException. (format "Error: maximum number of iterations [%s] exceeded, aborting flow." max)))
+
+;;         ;; keep trying to transition
+;;         :else
+;;         (recur [next-state next-context]
+;;                (transition-once! workflow next-state next-context)
+;;                (dec iterations))))))
+
+;; (defn old-workflow-to-dot [workflow current-state]
+;;   (let [workflow (get-workflow workflow)
+;;         sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))]
+;;     (doseq [state (keys (:states workflow))]
+;;       (let [shape (if (or (:start (get (:states workflow) state))
+;;                           (empty? (:transitions (get (:states workflow) state))))
+;;                     "ellipse"
+;;                     "box")
+;;             style (if (= current-state state)
+;;                     "bold"
+;;                     "")]
+
+;;         (.append sb (format "  \"%s\" [shape=%s,style=%s];\n" (name state)
+;;                             shape style)))
+;;       (doseq [transition (:transitions (get (:states workflow) state))]
+;;         ;; name the edges...
+;;         (let [to-state (:state transition)
+;;               transition-type
+;;               (cond (:if transition)
+;;                     ""
+;;                     (:unless transition)
+;;                     "!"
+;;                     :else
+;;                     (throw
+;;                      (RuntimeException.
+;;                       (format
+;;                        "Error: no :if or :unless in transition: %s for %s"
+;;                        transition
+;;                        state))))
+;;               pred-name (or (:if transition)
+;;                             (:unless transition))]
+;;           (.append sb (format "  \"%s\" -> \"%s\" [label=\" %s%s\"];\n"
+;;                               (name state)
+;;                               (name to-state)
+;;                               transition-type
+;;                               (name pred-name))))))
+;;     (.append sb "}\n")
+;;     (str sb)))
 
 
-(defn path-tracing-trigger [workflow curr-state next-state context]
-  (assoc
-      context
-    :trace (conj (:trace context [])
-                 [curr-state next-state])))
 
-(defn workflow-to-dot [workflow & [current-state]]
-  (let [workflow (get-workflow workflow)
-        current-state (or current-state (get-start-state workflow))
-        sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))
-        node-shape-fn
-        (fn [node node-info]
-          (cond
-            (or (:start node-info)
-                (:stop node-info))
-            "ellipse"
-            (= :action (:type node-info))
-            "box"
-            (= :branch (:type node-info))
-            "diamond"
-            :else
-            "box"))
-        connection-label-fn
-        (fn [connection]
-          (cond
-            (:default connection)
-            "yes"
-            (:if connection)
-            (name (:if connection))
-            (:unless connection)
-            (str "!" (name (:unless connection)))
-            :else
-            "unnamed?"))]
-    (doseq [node (keys (:nodes workflow))]
-      (let [node-info (get (:nodes workflow) node)
-            style (if (= current-state node) ",style=bold" "")]
-        (.append sb (format "  \"%s\" [shape=%s,%s];\n" (name node) (node-shape-fn node node-info) style)))
-      (doseq [connection (get-in workflow [:nodes node :connections])]
-        ;; name the edges...
-        (let [to-node (:to connection)]
-          (.append sb (format "  \"%s\" -> \"%s\" [label=\"%s\"];\n"
-                              (name node)
-                              (name to-node)
-                              (connection-label-fn connection))))))
-    (.append sb "}\n")
-    (str sb)))
+
+;; (defn get-start-state [workflow]
+;;   (first (first (filter (fn [[k v]]
+;;                           (:start v))
+;;                         (:states (get-workflow workflow))))))
+
+;; (defn initialize-workflow [workflow context]
+;;   "Executes start-state triggers."
+;;   (let [workflow    (get-workflow    workflow)
+;;         start-state (get-start-state workflow)
+;;         state-info  (get (:states workflow) start-state)
+;;         triggers    (seqize-triggers (:on-entry state-info))]
+;;     (loop [[trigger triggers] triggers
+;;            context context]
+;;       (printf "initialize-workflow: trigger=%s context=%s\n" trigger context)
+;;       (if trigger
+;;         (recur triggers
+;;                (execute-trigger trigger workflow nil start-state context))
+;;         (assoc
+;;             context
+;;           :uuid (str (java.util.UUID/randomUUID)))))))
+
+
+;; (defn path-tracing-trigger [workflow curr-state next-state context]
+;;   (assoc
+;;       context
+;;     :trace (conj (:trace context [])
+;;                  [curr-state next-state])))
+
+;; (defn workflow-to-dot [workflow & [current-state]]
+;;   (let [workflow (get-workflow workflow)
+;;         current-state (or current-state (get-start-state workflow))
+;;         sb (StringBuilder. (format "digraph \"%s\" {\n" (name (:name workflow))))
+;;         node-shape-fn
+;;         (fn [node node-info]
+;;           (cond
+;;             (or (:start node-info)
+;;                 (:stop node-info))
+;;             "ellipse"
+;;             (= :action (:type node-info))
+;;             "box"
+;;             (= :branch (:type node-info))
+;;             "diamond"
+;;             :else
+;;             "box"))
+;;         connection-label-fn
+;;         (fn [connection]
+;;           (cond
+;;             (:default connection)
+;;             "yes"
+;;             (:if connection)
+;;             (name (:if connection))
+;;             (:unless connection)
+;;             (str "!" (name (:unless connection)))
+;;             :else
+;;             "unnamed?"))]
+;;     (doseq [node (keys (:nodes workflow))]
+;;       (let [node-info (get (:nodes workflow) node)
+;;             style (if (= current-state node) ",style=bold" "")]
+;;         (.append sb (format "  \"%s\" [shape=%s,%s];\n" (name node) (node-shape-fn node node-info) style)))
+;;       (doseq [connection (get-in workflow [:nodes node :connections])]
+;;         ;; name the edges...
+;;         (let [to-node (:to connection)]
+;;           (.append sb (format "  \"%s\" -> \"%s\" [label=\"%s\"];\n"
+;;                               (name node)
+;;                               (name to-node)
+;;                               (connection-label-fn connection))))))
+;;     (.append sb "}\n")
+;;     (str sb)))
