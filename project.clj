@@ -22,4 +22,4 @@
                          :1.6 {:dependencies [[org.clojure/clojure "1.6.0-master-SNAPSHOT"]]}}
   :aliases              {"all" ["with-profile" "dev,1.2:dev,1.3:dev,1.4:dev,1.5:dev,1.6"]}
   :global-vars          {*warn-on-reflection* true}
-  :dependencies         [])
+  :dependencies         [[org.clojure/tools.logging "[0.3.1,)"]])

@@ -1,6 +1,7 @@
 (ns impresario.core
   (:require
-   [clojure.pprint :as pp])
+   [clojure.pprint :as pp]
+   [clojure.tools.logging :as log])
   (:use
    [clojure.string :only [join]]))
 
@@ -127,8 +128,14 @@
   (if-not (contains? (:states workflow) current-state)
     (throw (RuntimeException. (format  "Error: current-state of %s is invalid. No point in checking transition possibilities." current-state ))))
   (let [pred       (get-transition-predicate-fn transition-info)
-        state-name (:state transition-info)]
-    (if (pred workflow current-state context)
+        state-name (:state transition-info)
+        result     (pred workflow current-state context)]
+    (log/debugf "[%s]can-transition-to? current-state=%s state-name=%s prediate-result=%s"
+               (if result "YES" "NO!")
+               current-state
+               state-name
+               result)
+    (if result
       state-name
       nil)))
 
